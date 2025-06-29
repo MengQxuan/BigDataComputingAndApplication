@@ -1,0 +1,231 @@
+import random
+from math import sqrt
+import numpy as np
+from tqdm import tqdm
+from matplotlib import pyplot as plt
+
+# -------------------- Dataset 部分 --------------------
+
+class TrainSet:
+    def __init__(self, data):
+        # data: list of (user, item, rating) tuples
+        self.raw_data = data
+        self.user2id = {}
+        self.item2id = {}
+        self.id2user = {}
+        self.id2item = {}
+        self.user_ratings = {}
+        self.item_ratings = {}
+
+        user_cnt = 0
+        item_cnt = 0
+        for user, item, rating in data:
+            if user not in self.user2id:
+                self.user2id[user] = user_cnt
+                self.id2user[user_cnt] = user
+                user_cnt += 1
+            if item not in self.item2id:
+                self.item2id[item] = item_cnt
+                self.id2item[item_cnt] = item
+                item_cnt += 1
+            uid = self.user2id[user]
+            iid = self.item2id[item]
+            self.user_ratings.setdefault(uid, []).append((iid, rating))
+            self.item_ratings.setdefault(iid, []).append((uid, rating))
+
+        self.num_users = user_cnt
+        self.num_items = item_cnt
+
+    def get_all_ratings(self):
+        for user, item, rating in self.raw_data:
+            uid = self.user2id[user]
+            iid = self.item2id[item]
+            yield uid, iid, rating
+
+    def calculate_mean_rating(self):
+        total = sum(r for _, _, r in self.raw_data)
+        return total / len(self.raw_data)
+
+    def exist_user(self, user: str) -> bool:
+        return user in self.user2id
+
+    def exist_item(self, item: str) -> bool:
+        return item in self.item2id
+
+    def get_map_userid(self, user: str) -> int:
+        return self.user2id[user]
+
+    def get_map_itemid(self, item: str) -> int:
+        return self.item2id[item]
+
+# -------------------- Model (SVD) 部分 --------------------
+
+class SVDModel:
+    def __init__(self, features=20, epochs=20, lr=0.002, regularization=0.025):
+        self.features = features
+        self.epochs = epochs
+        self.lr = lr
+        self.regularization = regularization
+        self.UserBias = None
+        self.ItemBias = None
+        self.UserCharacteristicMatrix = None
+        self.ItemCharacteristicMatrix = None
+
+    def SVDtrain(self, trainset: TrainSet):
+        self.trainset = trainset
+        rand = np.random.RandomState(0)
+        self.UserBias = np.zeros(trainset.num_users, np.double)
+        self.ItemBias = np.zeros(trainset.num_items, np.double)
+        self.UserCharacteristicMatrix = rand.normal(0.0, 0.05, (trainset.num_users, self.features))
+        self.ItemCharacteristicMatrix = rand.normal(0.0, 0.05, (trainset.num_items, self.features))
+        mean_rating = trainset.calculate_mean_rating()
+
+        x, y = [], []
+        for epoch in range(self.epochs):
+            print(f"第 {epoch + 1} 轮迭代...")
+            lr = self.lr / (2.0 ** epoch)
+            sum_eui_squared = 0.0
+            num_ratings = 0
+
+            for uid, iid, rating in tqdm(trainset.get_all_ratings()):
+                num_ratings += 1
+                multi = np.dot(self.ItemCharacteristicMatrix[iid], self.UserCharacteristicMatrix[uid])
+                predict = mean_rating + self.UserBias[uid] + self.ItemBias[iid] + multi
+                predict = min(max(predict, 0), 100)
+                eui = rating - predict
+                sum_eui_squared += eui ** 2
+
+                self.UserBias[uid] += lr * (eui - self.regularization * self.UserBias[uid])
+                self.ItemBias[iid] += lr * (eui - self.regularization * self.ItemBias[iid])
+
+                for i in range(self.features):
+                    temp = self.UserCharacteristicMatrix[uid, i]
+                    self.UserCharacteristicMatrix[uid, i] += lr * (eui * self.ItemCharacteristicMatrix[iid, i] - self.regularization * temp)
+                    self.ItemCharacteristicMatrix[iid, i] += lr * (eui * temp - self.regularization * self.ItemCharacteristicMatrix[iid, i])
+
+            rmse = sqrt(sum_eui_squared / num_ratings)
+            x.append(epoch + 1)
+            y.append(rmse)
+            print(f"train_RMSE: {rmse}\n")
+
+        plt.title("train_RMSE")
+        plt.xlabel("epoch")
+        plt.ylabel("RMSE")
+        plt.plot(x, y)
+        plt.savefig('train_RMSE.png')
+        plt.show()
+
+    def SVDpredict(self, testset):
+        pred = []
+        for user, item in tqdm(testset):
+            score = self.trainset.calculate_mean_rating()
+
+            if self.trainset.exist_user(user) and self.trainset.exist_item(item):
+                uid = self.trainset.get_map_userid(user)
+                iid = self.trainset.get_map_itemid(item)
+                score += self.UserBias[uid] + self.ItemBias[iid] + np.dot(self.ItemCharacteristicMatrix[iid], self.UserCharacteristicMatrix[uid])
+            elif self.trainset.exist_user(user):
+                uid = self.trainset.get_map_userid(user)
+                score += self.UserBias[uid]
+            elif self.trainset.exist_item(item):
+                iid = self.trainset.get_map_itemid(item)
+                score += self.ItemBias[iid]
+
+            score = min(max(score, 0), 100)
+            pred.append(score)
+
+        return pred
+
+# -------------------- 训练部分 --------------------
+
+def calculateRMSE(pred, oracle):
+    sum_sq = sum((oracle[i] - pred[i]) ** 2 for i in range(len(pred)))
+    return sqrt(sum_sq / len(pred))
+
+def load_train_data(filename):
+    data = []
+    with open(filename, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    user = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if '|' in line:
+            user = line.split('|')[0]
+        else:
+            item, score = line.split()
+            data.append((user, item, int(score)))
+    return data
+
+def load_test_data(filename):
+    data = []
+    with open(filename, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    user = None
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if '|' in line:
+            user = line.split('|')[0]
+        else:
+            item = line.strip()
+            data.append((user, item))
+    return data
+
+def split_train_and_val(dataset, train_ratio, val_ratio):
+    assert train_ratio + val_ratio == 100
+    random.seed(1)
+    trainset = []
+    valset = []
+    for i in range(len(dataset)):
+        rand = random.randint(0, 100)
+        if rand == val_ratio:
+            valset.append(dataset[i])
+        else:
+            trainset.append(dataset[i])
+    return trainset, valset
+
+def train():
+    dataset = load_train_data('train.txt')
+    print("开始划分训练集、验证集...")
+    trainset_data, valset = split_train_and_val(dataset, 99, 1)
+    print("划分完毕！")
+
+    trainset = TrainSet(trainset_data)
+    model = SVDModel()
+
+    print("开始训练...")
+    model.SVDtrain(trainset)
+    print("训练完成！")
+
+    val = [(userid, itemid) for userid, itemid, _ in valset]
+    oracle = [score for _, _, score in valset]
+    pred = model.SVDpredict(val)
+    RMSE = calculateRMSE(pred, oracle)
+    print('val_RMSE:', RMSE)
+
+    testset = load_test_data('test.txt')
+    rating_counts = {}
+    for user, _ in testset:
+        rating_counts[user] = rating_counts.get(user, 0) + 1
+
+    print("开始预测...")
+    pred = model.SVDpredict(testset)
+    print("\n预测完成！")
+
+    print("保存结果...")
+    with open('Result.txt', 'w+', encoding='utf-8') as f:
+        now_user = ""
+        for i in range(len(testset)):
+            user, item = testset[i]
+            score = pred[i]
+            if user != now_user:
+                now_user = user
+                f.write(user + '|' + str(rating_counts[user]) + '\n')
+            f.write(item + '  ' + str(score) + '\n')
+    print("保存完毕！")
+
+if __name__ == "__main__":
+    train()

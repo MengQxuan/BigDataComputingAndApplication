@@ -1,0 +1,190 @@
+import numpy as np
+from math import sqrt
+from tqdm import tqdm
+from matplotlib import pyplot as plt
+
+
+
+class SVDModel:
+
+    '''
+    SVD模型，用于矩阵分解的训练和预测。
+
+    参数说明：
+    - trainset: 训练集
+    - features: 特征维度
+    - epochs: 迭代次数
+    - lr: 学习率
+    - regularization: 正则化项
+    '''
+
+    def __init__(self, features=20, epochs=20, lr=0.002, regularization=0.025):
+        self.features = features
+        self.epochs = epochs
+        self.lr = lr
+        self.regularization = regularization
+        self.UserBias = None
+        self.ItemBias = None
+        self.UserCharacteristicMatrix = None
+        self.ItemCharacteristicMatrix = None
+
+    def initialize_matrices(self, trainset):
+        """
+        初始化模型所需的矩阵和偏置项。
+        """
+        rand = np.random.RandomState(0)
+        self.UserBias = np.zeros(trainset.num_users, np.double)
+        self.ItemBias = np.zeros(trainset.num_items, np.double)
+        self.UserCharacteristicMatrix = rand.normal(0.0, 0.05, (trainset.num_users, self.features))
+        self.ItemCharacteristicMatrix = rand.normal(0.0, 0.05, (trainset.num_items, self.features))
+
+    def update_matrices(self, uid, iid, rating, lr, regularization, mean_rating):
+        """
+        更新用户和物品的偏置项和特征矩阵。
+        """
+        multi = np.dot(self.ItemCharacteristicMatrix[iid], self.UserCharacteristicMatrix[uid])
+        predict = mean_rating + self.UserBias[uid] + self.ItemBias[iid] + multi
+        predict = min(max(predict, 0), 100)
+        eui = rating - predict
+
+        # 更新偏置项和特征矩阵
+        self.UserBias[uid] += lr * (eui - regularization * self.UserBias[uid])
+        self.ItemBias[iid] += lr * (eui - regularization * self.ItemBias[iid])
+        for i in range(self.features):
+            temp = self.UserCharacteristicMatrix[uid, i]
+            self.UserCharacteristicMatrix[uid, i] += lr * (eui * self.ItemCharacteristicMatrix[iid, i] - regularization * temp)
+            self.ItemCharacteristicMatrix[iid, i] += lr * (eui * temp - regularization * self.ItemCharacteristicMatrix[iid, i])
+        
+        return eui
+
+    def train_epoch(self, trainset, lr, epoch):
+        """
+        训练一个epoch。
+        """
+        sum_eui_squared = 0.0
+        num_ratings = 0
+        for uid, iid, rating in tqdm(trainset.get_all_ratings()):
+            num_ratings += 1
+            eui = self.update_matrices(uid, iid, rating, lr, self.regularization, trainset.calculate_mean_rating())
+            sum_eui_squared += eui ** 2
+
+        # 计算RMSE
+        rmse = sqrt(sum_eui_squared / num_ratings)
+        print(f"第 {epoch + 1} 轮训练，RMSE: {rmse}")
+        return rmse
+
+    def SVDtrain(self, trainset):
+        """
+        使用随机梯度下降法训练模型。
+        """
+        self.trainset = trainset
+        self.initialize_matrices(trainset)
+        mean_rating = trainset.calculate_mean_rating()
+
+        x, y = [], []
+
+        for epoch in range(self.epochs):
+            # 学习率随epoch递减
+            lr = self.lr / (2.0 ** epoch)
+
+            rmse = self.train_epoch(trainset, lr, epoch)
+
+            x.append(epoch + 1)
+            y.append(rmse)
+
+        # 绘制RMSE曲线
+        self.plot_rmse_curve(x, y)
+
+    def plot_rmse_curve(self, x, y):
+        """
+        绘制训练过程中的RMSE曲线。
+        """
+        plt.title("Train RMSE")
+        plt.xlabel("Epoch")
+        plt.ylabel("RMSE")
+        plt.plot(x, y)
+        plt.savefig('train_RMSE.png')
+        plt.show()
+
+    def SVDpredict(self, testset):
+        """
+        使用训练好的模型进行预测。
+        """
+        pred = []
+        for user, item in tqdm(testset):
+            score = self.trainset.calculate_mean_rating()
+
+            if self.trainset.exist_user(user) and self.trainset.exist_item(item):
+                uid = self.trainset.get_map_userid(user)
+                iid = self.trainset.get_map_itemid(item)
+                print(f"User ID: {uid}, Type: {type(uid)}")
+                print(f"Item ID: {iid}, Type: {type(iid)}")
+                score += self.UserBias[uid] + self.ItemBias[iid] + np.dot(self.ItemCharacteristicMatrix[iid], self.UserCharacteristicMatrix[uid])
+            elif self.trainset.exist_user(user):
+                uid = self.trainset.get_map_userid(user)
+                score += self.UserBias[uid]
+            elif self.trainset.exist_item(item):
+                iid = self.trainset.get_map_itemid(item)
+                score += self.ItemBias[iid]
+
+            # 限制评分在0到100之间
+            score = min(max(score, 0), 100)
+            pred.append(score)
+
+        return pred
+
+
+
+###################### dataset
+class TrainSet:
+    def __init__(self, data):
+        # data: list of (user, item, rating) tuples
+        self.raw_data = data
+        # 生成 user/item 映射表（映射成0~n编号）
+        self.user2id = {}
+        self.item2id = {}
+        self.id2user = {}
+        self.id2item = {}
+        self.user_ratings = {}
+        self.item_ratings = {}
+
+        user_cnt = 0
+        item_cnt = 0
+        for user, item, rating in data:
+            if user not in self.user2id:
+                self.user2id[user] = user_cnt
+                self.id2user[user_cnt] = user
+                user_cnt += 1
+            if item not in self.item2id:
+                self.item2id[item] = item_cnt
+                self.id2item[item_cnt] = item
+                item_cnt += 1
+            uid = self.user2id[user]
+            iid = self.item2id[item]
+            self.user_ratings.setdefault(uid, []).append((iid, rating))
+            self.item_ratings.setdefault(iid, []).append((uid, rating))
+
+        self.num_users = user_cnt
+        self.num_items = item_cnt
+
+    def get_all_ratings(self):
+        for user, item, rating in self.raw_data:
+            uid = self.user2id[user]
+            iid = self.item2id[item]
+            yield uid, iid, rating
+
+    def calculate_mean_rating(self):
+        total = sum(r for _, _, r in self.raw_data)
+        return total / len(self.raw_data)
+
+    def exist_user(self, user):
+        return user in self.user2id
+
+    def exist_item(self, item):
+        return item in self.item2id
+
+    def get_map_userid(self, user):
+        return self.user2id[user]
+
+    def get_map_itemid(self, item):
+        return self.item2id[item]
